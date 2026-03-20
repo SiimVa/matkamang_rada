@@ -301,12 +301,13 @@ def build_osm_map(data: dict, era: gpd.GeoDataFrame, layer_visibility: dict[str,
                     fill_opacity=1,
                 ).add_to(feature_group)
         else:
-            folium.GeoJson(gdf_wgs84, style_function=lambda _feature, style=style_kwargs: style).add_to(feature_group)
+            geojson_data = gdf_wgs84[["geometry"]].to_json()
+            folium.GeoJson(geojson_data, style_function=lambda _feature, style=style_kwargs: style).add_to(feature_group)
 
         feature_group.add_to(fmap)
 
     folium.GeoJson(
-        bbox,
+        bbox[["geometry"]].to_json(),
         name="Analüüsiala",
         style_function=lambda _feature: {"color": "black", "weight": 2, "fillOpacity": 0},
     ).add_to(fmap)
