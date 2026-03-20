@@ -262,7 +262,12 @@ def build_osm_map(data: dict, era: gpd.GeoDataFrame, layer_visibility: dict[str,
     bbox = data["bbox_gdf"].to_crs("EPSG:4326")
     bounds = bbox.total_bounds
     center = [(bounds[1] + bounds[3]) / 2, (bounds[0] + bounds[2]) / 2]
-    fmap = folium.Map(location=center, zoom_start=12, tiles="OpenStreetMap", control_scale=True)
+    fmap = folium.Map(location=center, zoom_start=12, tiles=None, control_scale=True)
+
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", overlay=False).add_to(fmap)
+    folium.TileLayer("CartoDB positron", name="CartoDB Positron", overlay=False).add_to(fmap)
+    folium.TileLayer("CartoDB voyager", name="CartoDB Voyager", overlay=False).add_to(fmap)
+    folium.TileLayer("Esri.WorldImagery", name="Esri Satelliit", overlay=False).add_to(fmap)
 
     feature_sources = {
         "eraomand": era,
