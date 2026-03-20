@@ -1,11 +1,17 @@
 from typing import Optional
 from urllib.parse import urlencode
 
+try:
+    import folium
+except ImportError:
+    folium = None
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import mgrs
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from pyproj import Transformer
@@ -69,6 +75,7 @@ def build_bbox(codes: list[str]) -> dict:
     bbox_geom = box(minx, miny, maxx, maxy)
     bbox_gdf = gpd.GeoDataFrame(geometry=[bbox_geom], crs="EPSG:3301")
     return {
+        "mgrs_codes": codes,
         "points_yx": pts_yx,
         "bbox_tuple": (minx, miny, maxx, maxy),
         "bbox_gdf": bbox_gdf,
@@ -114,6 +121,7 @@ def prepare_data(codes: list[str]) -> dict:
     data = {
         "bbox_gdf": bbox_info["bbox_gdf"],
         "bbox_tuple": bbox_tuple,
+        "mgrs_codes": bbox_info["mgrs_codes"],
         "points_yx": bbox_info["points_yx"],
     }
 
@@ -145,31 +153,29 @@ def prepare_data(codes: list[str]) -> dict:
     return data
 
 
-def build_landscape_results(data: dict) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "näitaja": [
-                "Seisuveekogud km2",
-                "Vooluveekogud km",
-                "Märgalad km2",
-                "Turbaväljad km2",
-                "Teed km",
-                "Rööbasteed km",
-                "Sihid km",
-                "Sillad arv",
-            ],
-            "väärtus": [
-                data["seisuveekogud"].area.sum() / 1e6,
-                data["vooluveekogud"].length.sum() / 1000,
-                data["margalad"].area.sum() / 1e6,
-                data["turbavaljad"].area.sum() / 1e6,
-                data["teed"].length.sum() / 1000,
-                data["roobasteed"].length.sum() / 1000,
-                data["sihid"].length.sum() / 1000,
-                len(data["sillad"]),
-            ],
-        }
-    )
+def build_landscape_results(data: dict, layer_visibility: dict[str, bool]) -> pd.DataFrame:
+    metrics = [
+        ("seisuveekogud", "Seisuveekogud (km2)", data["seisuveekogud"].area.sum() / 1e6),
+        ("vooluveekogud", "Vooluveekogud (km)", data["vooluveekogud"].length.sum() / 1000),
+        ("margalad", "Märgalad (km2)", data["margalad"].area.sum() / 1e6),
+        ("turbavaljad", "Turbaväljad (km2)", data["turbavaljad"].area.sum() / 1e6),
+        ("teed", "Teed (km)", data["teed"].length.sum() / 1000),
+        ("roobasteed", "Rööbasteed (km)", data["roobasteed"].length.sum() / 1000),
+        ("sihid", "Sihid (km)", data["sihid"].length.sum() / 1000),
+        ("sillad", "Sillad (arv)", float(len(data["sillad"]))),
+    ]
+    rows = []
+    for layer_key, label, value in metrics:
+        if not layer_visibility.get(layer_key, False):
+            continue
+        rows.append(
+            {
+                "Näitaja": label,
+                "Väärtus": value,
+                "Olemas": "Jah" if value > 0 else "Ei",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def detect_private_owner(ky_clip: gpd.GeoDataFrame, target: str) -> tuple[Optional[str], gpd.GeoDataFrame, gpd.GeoDataFrame]:
@@ -204,25 +210,135 @@ def build_owner_tables(ky_clip: gpd.GeoDataFrame, target: str) -> tuple[pd.DataF
         .fillna("PUUDUB")
         .astype(str)
         .value_counts()
-        .rename_axis("omvorm")
-        .reset_index(name="arv")
+        .rename_axis("Omandivorm")
+        .reset_index(name="Arv")
     )
-    dist_count["osakaal_%"] = (dist_count["arv"] / dist_count["arv"].sum() * 100).round(2)
+    dist_count["Osakaal (%)"] = (dist_count["Arv"] / dist_count["Arv"].sum() * 100).round(2)
 
     if "pindala" in ky_clip.columns:
         ky_clip = ky_clip.copy()
-        ky_clip["pindala_m2"] = pd.to_numeric(ky_clip["pindala"], errors="coerce")
+        ky_clip["area_value"] = pd.to_numeric(ky_clip["pindala"], errors="coerce")
     else:
         ky_clip = ky_clip.copy()
-        ky_clip["pindala_m2"] = ky_clip.geometry.area
+        ky_clip["area_value"] = ky_clip.geometry.area
 
-    dist_area = ky_clip.groupby(target, dropna=False)["pindala_m2"].sum().reset_index()
+    dist_area = ky_clip.groupby(target, dropna=False)["area_value"].sum().reset_index()
     dist_area[target] = dist_area[target].fillna("PUUDUB").astype(str)
-    dist_area["pindala_km2"] = dist_area["pindala_m2"] / 1e6
-    dist_area["area_osakaal_%"] = (dist_area["pindala_m2"] / dist_area["pindala_m2"].sum() * 100).round(2)
-    dist_area = dist_area.rename(columns={target: "omvorm"})
+    dist_area["Pindala (km2)"] = dist_area["area_value"] / 1e6
+    total_area = dist_area["area_value"].sum()
+    if total_area:
+        dist_area["Osakaal (%)"] = (dist_area["area_value"] / total_area * 100).round(2)
+    else:
+        dist_area["Osakaal (%)"] = 0.0
+    dist_area = dist_area.rename(columns={target: "Omandivorm"}).drop(columns=["area_value"])
 
     return dist_count, dist_area
+
+
+def format_analysis_summary(data: dict) -> str:
+    area_km2 = data["bbox_gdf"].geometry.area.iloc[0] / 1e6
+    mgrs_lines = "\n".join(f"{idx}. {code}" for idx, code in enumerate(data["mgrs_codes"], start=1))
+    return f"MGRS punktid:\n{mgrs_lines}\n\nAla suurus: {area_km2:.2f} km2"
+
+
+def get_layer_catalog() -> list[tuple[str, str, str, dict]]:
+    return [
+        ("seisuveekogud", "Seisuveekogud", "polygon", {"color": "blue", "fillColor": "lightblue", "weight": 1, "fillOpacity": 0.5}),
+        ("vooluveekogud", "Vooluveekogud", "line", {"color": "blue", "weight": 2}),
+        ("margalad", "Märgalad", "polygon", {"color": "darkgreen", "weight": 1, "fillColor": "#7fbf7b", "fillOpacity": 0.2}),
+        ("turbavaljad", "Turbaväljad", "polygon", {"color": "#8c510a", "weight": 1, "fillColor": "#bf812d", "fillOpacity": 0.25}),
+        ("teed", "Teed", "line", {"color": "black", "weight": 3}),
+        ("roobasteed", "Rööbasteed", "line", {"color": "red", "weight": 2}),
+        ("sihid", "Sihid", "line", {"color": "black", "weight": 2, "dashArray": "6, 4"}),
+        ("sillad", "Sillad", "point", {}),
+        ("eraomand", "Eraomand", "polygon", {"color": "red", "weight": 1, "fillColor": "#ff8080", "fillOpacity": 0.15}),
+    ]
+
+
+def build_osm_map(data: dict, era: gpd.GeoDataFrame, layer_visibility: dict[str, bool]) -> Optional[str]:
+    if folium is None:
+        return None
+
+    bbox = data["bbox_gdf"].to_crs("EPSG:4326")
+    bounds = bbox.total_bounds
+    center = [(bounds[1] + bounds[3]) / 2, (bounds[0] + bounds[2]) / 2]
+    fmap = folium.Map(location=center, zoom_start=12, tiles="OpenStreetMap", control_scale=True)
+
+    feature_sources = {
+        "eraomand": era,
+        "seisuveekogud": data["seisuveekogud"],
+        "vooluveekogud": data["vooluveekogud"],
+        "margalad": data["margalad"],
+        "turbavaljad": data["turbavaljad"],
+        "teed": data["teed"],
+        "roobasteed": data["roobasteed"],
+        "sihid": data["sihid"],
+        "sillad": data["sillad"],
+    }
+
+    for layer_key, layer_label, geometry_type, style_kwargs in get_layer_catalog():
+        if not layer_visibility.get(layer_key, False):
+            continue
+
+        gdf = feature_sources[layer_key]
+        if gdf.empty:
+            continue
+
+        feature_group = folium.FeatureGroup(name=layer_label, show=True)
+        gdf_wgs84 = gdf.to_crs("EPSG:4326")
+
+        if geometry_type == "point":
+            for geom in gdf_wgs84.geometry:
+                if geom is None or geom.is_empty:
+                    continue
+                folium.CircleMarker(
+                    location=[geom.y, geom.x],
+                    radius=5,
+                    color="black",
+                    weight=1,
+                    fill=True,
+                    fill_color="yellow",
+                    fill_opacity=1,
+                ).add_to(feature_group)
+        else:
+            folium.GeoJson(gdf_wgs84, style_function=lambda _feature, style=style_kwargs: style).add_to(feature_group)
+
+        feature_group.add_to(fmap)
+
+    folium.GeoJson(
+        bbox,
+        name="Analüüsiala",
+        style_function=lambda _feature: {"color": "black", "weight": 2, "fillOpacity": 0},
+    ).add_to(fmap)
+
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 24px;
+        left: 24px;
+        z-index: 9999;
+        background: white;
+        border: 1px solid black;
+        padding: 10px 12px;
+        font-size: 13px;
+        line-height: 1.5;
+    ">
+      <strong>Legend</strong><br>
+      <span style="display:inline-block;width:12px;height:12px;background:lightblue;border:1px solid blue;margin-right:6px;"></span>Seisuveekogud<br>
+      <span style="display:inline-block;width:12px;height:2px;background:blue;margin-right:6px;vertical-align:middle;"></span>Vooluveekogud<br>
+      <span style="display:inline-block;width:12px;height:12px;background:#7fbf7b;border:1px solid darkgreen;margin-right:6px;"></span>Märgalad<br>
+      <span style="display:inline-block;width:12px;height:12px;background:#bf812d;border:1px solid #8c510a;margin-right:6px;"></span>Turbaväljad<br>
+      <span style="display:inline-block;width:12px;height:2px;background:black;margin-right:6px;vertical-align:middle;"></span>Teed<br>
+      <span style="display:inline-block;width:12px;height:2px;background:red;margin-right:6px;vertical-align:middle;"></span>Rööbasteed<br>
+      <span style="display:inline-block;width:12px;height:2px;border-top:2px dashed black;margin-right:6px;vertical-align:middle;"></span>Sihid<br>
+      <span style="display:inline-block;width:10px;height:10px;background:yellow;border:1px solid black;border-radius:50%;margin-right:6px;"></span>Sillad<br>
+      <span style="display:inline-block;width:12px;height:12px;background:#ff8080;border:1px solid red;margin-right:6px;"></span>Eraomand
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(legend_html))
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+    return fmap.get_root().render()
 
 
 def add_legend(ax, include_era: bool = False) -> None:
@@ -385,7 +501,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Sisend")
-        mgrs_input = st.text_area("MGRS punktid", value=DEFAULT_MGRS, height=160)
+        mgrs_input = st.text_area("MGRS punktid", key="mgrs_input", height=160, placeholder=DEFAULT_MGRS)
         st.caption("Sisesta üks MGRS kood reale. Vähemalt 2 punkti, soovitatavalt 4 BBOX moodustamiseks.")
 
         st.subheader("Kaardikihid")
@@ -403,59 +519,45 @@ def main() -> None:
 
         run_analysis = st.button("Käivita analüüs", type="primary", use_container_width=True)
 
-    if not run_analysis:
+    if run_analysis:
+        try:
+            codes = parse_mgrs_codes(mgrs_input)
+            with st.spinner("Laen ETAK ja katastri andmeid..."):
+                data = prepare_data(codes)
+            st.session_state["analysis_data"] = data
+        except Exception as exc:
+            st.error(f"Andmete laadimine ebaõnnestus: {exc}")
+            return
+
+    data = st.session_state.get("analysis_data")
+    if data is None:
         st.info("Muuda vasakul sisendeid ja käivita analüüs.")
         return
 
-    try:
-        codes = parse_mgrs_codes(mgrs_input)
-        with st.spinner("Laen ETAK ja katastri andmeid..."):
-            data = prepare_data(codes)
-    except Exception as exc:
-        st.error(f"Andmete laadimine ebaõnnestus: {exc}")
-        return
-
-    st.success("Analüüs valmis.")
+    if run_analysis:
+        st.success("Analüüs valmis.")
+    else:
+        st.info("Kuvatud on viimati käivitatud analüüs. Kaardikihte saad muuta ilma tulemust kaotamata.")
 
     col1, col2 = st.columns([1.2, 1])
     with col1:
         st.subheader("Analüüsiala")
-        minx, miny, maxx, maxy = data["bbox_tuple"]
-        st.code(
-            "\n".join(
-                [
-                    f"MGRS punktid (L-EST97, y/x): {data['points_yx']}",
-                    f"BBOX: ({minx:.2f}, {miny:.2f}, {maxx:.2f}, {maxy:.2f})",
-                ]
-            )
-        )
+        st.code(format_analysis_summary(data))
     with col2:
-        st.subheader("Objektide arv")
-        stats = pd.DataFrame(
-            {
-                "kiht": ["Veekogud", "Vooluveekogud", "Märgalad", "Turbaväljad", "Teed", "Rööbasteed", "Sihid", "Sillad", "Katastriüksused"],
-                "objekte": [
-                    len(data["seisuveekogud"]),
-                    len(data["vooluveekogud"]),
-                    len(data["margalad"]),
-                    len(data["turbavaljad"]),
-                    len(data["teed"]),
-                    len(data["roobasteed"]),
-                    len(data["sihid"]),
-                    len(data["sillad"]),
-                    len(data["ky_clip"]),
-                ],
-            }
-        )
-        st.dataframe(stats, use_container_width=True, hide_index=True)
+        st.subheader("Aktiivsed kihid")
+        active_layers = [label for key, label, _, _ in get_layer_catalog() if layer_visibility.get(key, False)]
+        st.write(", ".join(active_layers) if active_layers else "Ühtegi kaardikihti pole valitud.")
 
-    landscape_results = build_landscape_results(data)
+    landscape_results = build_landscape_results(data, layer_visibility)
     st.subheader("Maastiku analüüs")
-    st.dataframe(
-        landscape_results.style.format({"väärtus": "{:.2f}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
+    if landscape_results.empty:
+        st.info("Maastikuanalüüsi tabel on tühi, sest ükski vastav kaartkiht pole aktiivne.")
+    else:
+        st.dataframe(
+            landscape_results.style.format({"Väärtus": "{:.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     target = "omvorm"
     if target in data["ky_clip"].columns and not data["ky_clip"].empty:
@@ -466,11 +568,15 @@ def main() -> None:
         table_col1, table_col2 = st.columns(2)
         with table_col1:
             st.caption("Jaotus arvu järgi")
-            st.dataframe(dist_count, use_container_width=True, hide_index=True)
+            st.dataframe(
+                dist_count.style.format({"Osakaal (%)": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
         with table_col2:
             st.caption("Jaotus pindala järgi")
             st.dataframe(
-                dist_area.style.format({"pindala_m2": "{:.0f}", "pindala_km2": "{:.3f}", "area_osakaal_%": "{:.2f}"}),
+                dist_area.style.format({"Pindala (km2)": "{:.3f}", "Osakaal (%)": "{:.2f}"}),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -483,7 +589,7 @@ def main() -> None:
         st.warning("Katastri kihis puudub väli `omvorm`, seega omandivormi jaotust ei arvutatud.")
 
     st.subheader("Kaardid")
-    tab1, tab2, tab3 = st.tabs(["Analüüsiala", "Eraomand", "Koondkaart"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Analüüsiala", "Eraomand", "Koondkaart", "OSM"])
 
     with tab1:
         fig = plot_analysis_map(data, layer_visibility)
@@ -499,6 +605,20 @@ def main() -> None:
         fig = plot_combined_map(data, era, layer_visibility)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
+
+    with tab4:
+        osm_html = build_osm_map(data, era, layer_visibility)
+        if osm_html is None:
+            st.warning("OSM kaart vajab paketti `folium`. Lisa see sõltuvustesse ja paigalda keskkonda.")
+        else:
+            components.html(osm_html, height=700)
+            st.download_button(
+                "Laadi OSM kaart alla HTML-na",
+                data=osm_html,
+                file_name="analuusi_kaart_osm.html",
+                mime="text/html",
+                use_container_width=True,
+            )
 
 
 if __name__ == "__main__":
